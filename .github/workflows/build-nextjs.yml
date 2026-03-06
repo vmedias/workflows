@@ -4,16 +4,18 @@ on:
   workflow_call:
     inputs:
       image:
-        description: "Full image name (e.g. ghcr.io/vmedias/my-app)"
         required: true
         type: string
       tag:
-        description: "Tag to apply (e.g. staging)"
         required: false
         type: string
         default: staging
       build_args:
-        description: "Docker build args (multiline key=value)"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "GitHub environment to use for vars"
         required: false
         type: string
         default: ""
