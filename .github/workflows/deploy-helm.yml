@@ -1,0 +1,66 @@
+name: Deploy with Helm
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "Helm release name"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        type: string
+      chart:
+        description: "Helm chart to use"
+        required: false
+        type: string
+        default: vmedias/nextjs-app
+      chart_version:
+        description: "Helm chart version"
+        required: false
+        type: string
+        default: ""
+      values_file:
+        description: "Path to values file"
+        required: false
+        type: string
+        default: k8s/values-staging.yaml
+      image_tag:
+        description: "Image tag to deploy"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: Helm deploy
+    runs-on: k3s-home
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl and Helm
+        run: |
+          ARCH=$(uname -m)
+          case $ARCH in
+            x86_64)  KUBECTL_ARCH="amd64" ;;
+            aarch64) KUBECTL_ARCH="arm64" ;;
+          esac
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/${KUBECTL_ARCH}/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      - name: Deploy
+        run: |
+          helm repo add vmedias https://vmedias.github.io/helm-charts
+          helm repo update
+          helm upgrade --install ${{ inputs.app_name }} ${{ inputs.chart }} \
+            --namespace ${{ inputs.namespace }} \
+            -f ${{ inputs.values_file }} \
+            --set image.tag=${{ inputs.image_tag }} \
+            ${{ inputs.chart_version != '' && format('--version {0}', inputs.chart_version) || '' }}
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/${{ inputs.app_name }} \
+            -n ${{ inputs.namespace }} --timeout=120s
