@@ -30,25 +30,30 @@ on:
         description: "Image tag to deploy"
         required: true
         type: string
+    secrets:
+      KUBECONFIG:
+        description: "Base64-encoded kubeconfig for the target cluster"
+        required: true
 
 jobs:
   deploy:
     name: Helm deploy
-    runs-on: k3s-home
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl and Helm
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Configure kubeconfig
         run: |
-          ARCH=$(uname -m)
-          case $ARCH in
-            x86_64)  KUBECTL_ARCH="amd64" ;;
-            aarch64) KUBECTL_ARCH="arm64" ;;
-          esac
-          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/${KUBECTL_ARCH}/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
       - name: Deploy
         run: |
@@ -56,6 +61,7 @@ jobs:
           helm repo update
           helm upgrade --install ${{ inputs.app_name }} ${{ inputs.chart }} \
             --namespace ${{ inputs.namespace }} \
+            --create-namespace \
             -f ${{ inputs.values_file }} \
             --set image.tag=${{ inputs.image_tag }} \
             ${{ inputs.chart_version != '' && format('--version {0}', inputs.chart_version) || '' }}
