@@ -1,149 +1,146 @@
-# Deploy with Helm — GitHub-hosted runner setup
+# Deploy with Helm — self-hosted runner setup (ARC, scale-to-zero)
 
-The `deploy-helm.yml` workflow now runs on GitHub-hosted `ubuntu-latest`
-runners instead of the self-hosted `k3s-home` runner. A GitHub-hosted runner
-lives outside your network, so it needs two things:
+The `deploy-helm.yml` workflow runs on a **self-hosted** runner labelled
+`k3s-vmedias`, provided by **Actions Runner Controller (ARC)** inside the k3s
+cluster. Runners are **ephemeral and scale to zero**: no pod runs when idle, a
+pod spins up per queued job and is destroyed after. Everything is `kubectl` /
+`helm` — no host install, no kubeconfig file.
 
-1. A **kubeconfig** to authenticate against the cluster.
-2. **Network reachability** to the k3s API server (default port `6443`).
+## Why self-hosted (not GitHub-hosted)
+
+A GitHub-hosted runner lives outside the network, so it needs a `KUBECONFIG`
+secret + network reachability (Tailscale / tunnel) to the API server. To avoid
+re-adding that secret on every project, the natural move is an **org-level**
+secret — but on the current GitHub plan **org secrets are only available for
+public repos**. Our project repos are private, so an org `KUBECONFIG` can't be
+shared to them.
+
+Running runners **in the cluster** sidesteps all of it:
+
+- They reach the k3s API over the in-cluster endpoint — no exposed endpoint,
+  no Tailscale.
+- `kubectl` / `helm` use the runner pod's **in-cluster ServiceAccount** token
+  automatically — no `KUBECONFIG` secret, no `k3s.yaml` to copy.
+- Bind that SA to `cluster-admin` and `--create-namespace` works.
+
+## Why ARC (not a plain Deployment)
+
+A plain `Deployment` runner idles 24/7 for nothing. ARC is GitHub's official
+k8s-native autoscaler: it watches the job queue and creates an **ephemeral**
+runner pod only when a job is queued, then deletes it. `minRunners: 0` ⇒ zero
+pods at rest. Cost: ~10-30s cold start (image pull + register) on the first job
+after idle.
 
 ---
 
-## 1. Make the k3s API reachable
+## 1. Install the ARC controller
 
-The GitHub runner must reach the API server. Pick one:
+The controller chart ships the CRDs (`AutoscalingRunnerSet`, …). It **must**
+install before the scale-set, and at the **same chart version**.
 
-| Option | Effort | Exposure | Notes |
-|--------|--------|----------|-------|
-| **Public endpoint + firewall allowlist** | Low | API on internet | GitHub runner IPs are dynamic — allowlisting is impractical. Not recommended. |
-| **Tailscale / WireGuard** | Medium | None | Add a step to join the runner to your tailnet, then use the cluster's tailnet IP in the kubeconfig. Recommended. |
-| **Cloudflare Tunnel** | Medium | None | Expose API server through a tunnel, lock with mTLS / access policy. |
+```bash
+ARC_VERSION=0.14.2
 
-### Tailscale (recommended)
+helm install arc \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller \
+  --version "$ARC_VERSION" \
+  -n arc-systems --create-namespace
+```
 
-Add before the kubeconfig step in `deploy-helm.yml`:
+One controller per cluster; it manages every scale-set. Confirm the CRDs landed
+before continuing:
+
+```bash
+kubectl get crd | grep actions.github.com
+# autoscalingrunnersets.actions.github.com
+# ephemeralrunners.actions.github.com  ...
+```
+
+---
+
+## 2. ServiceAccount + RBAC for runner pods
+
+Runner pods need cluster-admin so `kubectl`/`helm` can deploy (incl.
+`--create-namespace`). Create the SA in the runners namespace and bind it:
 
 ```yaml
-      - name: Connect Tailscale
-        uses: tailscale/github-action@v3
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-```
-
-The kubeconfig `server:` then points at the k3s node's tailnet IP
-(e.g. `https://100.x.y.z:6443`).
-
----
-
-## 2. Create a cluster-wide ServiceAccount
-
-The default k3s kubeconfig (`/etc/rancher/k3s/k3s.yaml`) is cluster-admin.
-Don't ship that file to CI — it carries a non-rotatable client cert. Create a
-dedicated ServiceAccount whose token you can revoke. The SA lives in one
-namespace (`kube-system` here) but a **ClusterRoleBinding** gives it
-cluster-wide reach.
-
-```bash
-# On a cluster node / with admin access
-kubectl -n kube-system create serviceaccount github-deployer
-```
-
-Pick the role for the binding:
-
-> **The workflow now runs `helm upgrade --install --create-namespace`.**
-> Creating a namespace is a cluster-scoped write, which the built-in `admin`
-> ClusterRole (Option B) **cannot** do. So unless you pre-create every target
-> namespace by hand, you need **Option A (`cluster-admin`)**.
-
-```bash
-# Option A — full cluster-admin. REQUIRED for --create-namespace.
-# Also needed if charts install CRDs or touch RBAC / cluster-scoped objects.
-kubectl create clusterrolebinding github-deployer-admin \
-  --clusterrole=cluster-admin \
-  --serviceaccount=kube-system:github-deployer
-
-# Option B — built-in `admin` across all namespaces, but cannot mutate
-# cluster-scoped resources (namespaces, nodes, PVs, CRDs, RBAC). Tighter
-# blast radius — only viable if you create the namespace manually first:
-#   kubectl create namespace <namespace>
-kubectl create clusterrolebinding github-deployer-admin \
-  --clusterrole=admin \
-  --serviceaccount=kube-system:github-deployer
-```
-
-Generate a long-lived token (k8s 1.24+ no longer auto-creates secrets):
-
-```bash
-kubectl -n kube-system create token github-deployer --duration=8760h
-```
-
-> Use Option A if `helm upgrade` ever fails with `cannot create resource
-> "customresourcedefinitions"` or similar cluster-scoped denials.
-
----
-
-## 3. Build the kubeconfig
-
-```bash
-SERVER="https://100.x.y.z:6443"     # tailnet IP or reachable endpoint
-TOKEN="<token from step 2>"
-
-# CA cert from the cluster (on a node):
-#   sudo cat /var/lib/rancher/k3s/server/tls/server-ca.crt | base64 -w0
-CA_DATA="<base64 CA cert>"
-
-cat > deploy-kubeconfig.yaml <<EOF
+# runner-rbac.yaml
 apiVersion: v1
-kind: Config
-clusters:
-- name: k3s
-  cluster:
-    server: ${SERVER}
-    certificate-authority-data: ${CA_DATA}
-contexts:
-- name: deploy
-  context:
-    cluster: k3s
-    user: github-deployer
-current-context: deploy
-users:
-- name: github-deployer
-  user:
-    token: ${TOKEN}
-EOF
+kind: Namespace
+metadata:
+  name: arc-runners
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gha-runner
+  namespace: arc-runners
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gha-runner-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: gha-runner
+  namespace: arc-runners
 ```
 
-Test locally:
-
 ```bash
-KUBECONFIG=./deploy-kubeconfig.yaml kubectl get pods -n staging
+kubectl apply -f runner-rbac.yaml
 ```
 
 ---
 
-## 4. Store the kubeconfig as a secret
+## 3. Install the runner scale-set
 
-The workflow reads `secrets.KUBECONFIG` (base64-encoded).
+The Helm **release name becomes the runner label** — name it `k3s-vmedias` so
+`runs-on: k3s-vmedias` matches. Auth via a PAT (classic, scopes `repo` +
+`admin:org`); a GitHub App is the cleaner alternative for production.
 
 ```bash
-base64 -w0 deploy-kubeconfig.yaml      # Linux
-base64 -i deploy-kubeconfig.yaml       # macOS (no -w flag)
+helm install k3s-vmedias \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  --version "$ARC_VERSION" \
+  -n arc-runners \
+  --set githubConfigUrl="https://github.com/vmedias" \
+  --set githubConfigSecret.github_token="<github-pat>" \
+  --set minRunners=0 \
+  --set maxRunners=3 \
+  --set template.spec.serviceAccountName=gha-runner
 ```
 
-Add the output as a repository (or org) secret named `KUBECONFIG`:
+- `githubConfigUrl` at the **org** (`/vmedias`) → every repo in the org can use
+  it. The org-runner equivalent of the org secret we couldn't have. Scope it to
+  selected repos under **Org → Actions → Runners → Runner groups**.
+- `minRunners=0` → scale to zero when idle.
+- `template.spec.serviceAccountName=gha-runner` → runner pods get the
+  cluster-admin SA, so `kubectl`/`helm` authenticate in-cluster with no
+  kubeconfig (token + CA mounted at
+  `/var/run/secrets/kubernetes.io/serviceaccount`).
 
-- Repo: **Settings → Secrets and variables → Actions → New repository secret**
-- Org-wide: **Org Settings → Secrets and variables → Actions**, scope to selected repos.
+---
 
-Delete the local `deploy-kubeconfig.yaml` after.
+## 4. Verify
+
+```bash
+kubectl -n arc-runners get pods                 # idle: only the listener pod
+kubectl -n arc-systems logs deploy/arc-gha-rs-controller | tail
+```
+
+The runner set appears under **Org → Settings → Actions → Runners** as
+`k3s-vmedias`. Trigger a deploy job — a runner pod is created for it, then
+disappears.
 
 ---
 
 ## 5. Call the workflow
 
-The reusable workflow now declares a required secret, so callers must pass it:
+No secrets required — the runner pod's ServiceAccount already has cluster access:
 
 ```yaml
 jobs:
@@ -154,20 +151,26 @@ jobs:
       namespace: staging
       image_tag: sha-${{ github.sha }}
       values_file: k8s/values-staging.yaml
-    secrets:
-      KUBECONFIG: ${{ secrets.KUBECONFIG }}
 ```
-
-Or `secrets: inherit` to forward all caller secrets.
 
 ---
 
-## Rotation
-
-`create token --duration` tokens expire. Re-run step 2 + step 4 before expiry,
-or set up a shorter-lived token with a scheduled refresh. To revoke
-immediately, delete the ServiceAccount (invalidates all its tokens):
+## Maintenance
 
 ```bash
-kubectl -n kube-system delete serviceaccount github-deployer
+# Change autoscaling bounds
+helm upgrade k3s-vmedias \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  -n arc-runners --reuse-values --set maxRunners=5
+
+# Rotate the PAT
+helm upgrade k3s-vmedias \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set \
+  -n arc-runners --reuse-values --set githubConfigSecret.github_token=<new-pat>
+
+# Remove the runner entirely
+helm uninstall k3s-vmedias -n arc-runners
 ```
+
+Cluster creds never leave the cluster — they're the runner pod's ServiceAccount
+token, auto-rotated by k8s and bound only to `gha-runner`.

@@ -35,10 +35,11 @@ secrets/ConfigMap applicatifs (voir §2).
 
 ## Prérequis cluster (une seule fois pour tout)
 
-- Le ServiceAccount `github-deployer` + ClusterRoleBinding existent.
-  Comme le workflow utilise `--create-namespace` (write cluster-scoped), il faut
-  le rôle **`cluster-admin`** (Option A dans [deploy-helm-setup.md](deploy-helm-setup.md)).
-- Le kubeconfig est généré et accessible (voir [deploy-helm-setup.md](deploy-helm-setup.md)).
+- Le **runner self-hosted** `k3s-vmedias` est fourni par **ARC** in-cluster
+  (scale-to-zero, au niveau org → dispo pour tous les repos). Les pods runner
+  utilisent un ServiceAccount lié à **cluster-admin**, donc `kubectl`/`helm`
+  s'authentifient via le token in-cluster et `--create-namespace` (write
+  cluster-scoped) marche d'office. Setup : [deploy-helm-setup.md](deploy-helm-setup.md).
 - **Creds ghcr au niveau node k3s** via `registries.yaml` — supprime le besoin
   d'un secret de pull dans chaque namespace. Sur **chaque node** :
 
@@ -64,18 +65,15 @@ secrets/ConfigMap applicatifs (voir §2).
 
 ## Étapes pour un nouveau projet
 
-### 1. Secret repo `KUBECONFIG`
+### 1. Aucun secret de déploiement
 
-Le workflow `deploy-helm.yml` déclare `KUBECONFIG` comme secret **requis**.
+Le deploy tourne sur le runner self-hosted `k3s-vmedias`, qui a déjà l'accès
+cluster (cluster-admin via `k3s.yaml` local). **Rien à configurer côté repo** :
+plus de secret `KUBECONFIG`.
 
-```bash
-base64 -i deploy-kubeconfig.yaml          # macOS
-# Settings → Secrets and variables → Actions → New repository secret
-#   Nom : KUBECONFIG   Valeur : sortie base64
-```
-
-> Astuce : créer plutôt le secret au niveau **org** (scope = repos sélectionnés)
-> pour ne pas le refaire à chaque projet.
+> Pourquoi pas un secret org `KUBECONFIG` (GitHub-hosted) : sur le plan GitHub
+> actuel les **secrets org ne sont dispos que pour les repos public**, et nos
+> repos sont privés. Le runner self-hosted enregistré au niveau org joue ce rôle.
 
 ### 2. Secrets applicatifs — uniquement si l'app utilise `envFrom`
 
@@ -149,9 +147,7 @@ jobs:
       chart: vmedias/nextjs-app          # ou laravel-app / symfony-app
       values_file: k8s/values-staging.yaml
       image_tag: sha-${{ github.sha }}
-    secrets:
-      KUBECONFIG: ${{ secrets.KUBECONFIG }}
-      # ou : secrets: inherit
+    # pas de bloc secrets : le runner k3s-vmedias a déjà l'accès cluster
 ```
 
 `image_tag: sha-${{ github.sha }}` correspond au tag `:sha-<sha>` poussé par le
@@ -172,9 +168,8 @@ inclus dans `deploy-helm.yml` (`kubectl rollout status`, timeout 120s).
 
 | Action | Fréquence |
 |--------|-----------|
-| SA `github-deployer` + ClusterRoleBinding `cluster-admin` | 1× cluster |
+| Runner `k3s-vmedias` via ARC scale-to-zero (SA cluster-admin, org) | 1× cluster |
 | `registries.yaml` (creds ghcr) sur les nodes | 1× cluster |
-| Secret repo/org `KUBECONFIG` | 1× (org : jamais si scope étendu) |
 | Secrets app dans le namespace | 1× par app, **et seulement si** `envFrom` |
 | Values file + workflow appelant | 1× par projet |
 | **Push sur la branche** | **à chaque déploiement** |
