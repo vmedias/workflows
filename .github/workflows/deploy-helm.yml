@@ -30,6 +30,11 @@ on:
         description: "Image tag to deploy"
         required: true
         type: string
+      manifests_path:
+        description: "Dossier Kustomize à appliquer après le helm upgrade (vide = aucun). ${IMAGE_TAG} y est substitué par image_tag."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   deploy:
@@ -55,6 +60,15 @@ jobs:
             -f ${{ inputs.values_file }} \
             --set image.tag=${{ inputs.image_tag }} \
             ${{ inputs.chart_version != '' && format('--version {0}', inputs.chart_version) || '' }}
+
+      - name: Apply extra manifests (kustomize)
+        if: ${{ inputs.manifests_path != '' }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        run: |
+          kubectl kustomize "${{ inputs.manifests_path }}" \
+            | envsubst '${IMAGE_TAG}' \
+            | kubectl apply -n ${{ inputs.namespace }} -f -
 
       - name: Wait for rollout
         run: |
