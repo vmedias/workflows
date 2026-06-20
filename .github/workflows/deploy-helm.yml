@@ -67,7 +67,7 @@ jobs:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
           kubectl kustomize "${{ inputs.manifests_path }}" \
-            | envsubst '${IMAGE_TAG}' \
+            | sed "s|\${IMAGE_TAG}|${IMAGE_TAG}|g" \
             | kubectl apply -n ${{ inputs.namespace }} -f -
 
       - name: Wait for rollout
